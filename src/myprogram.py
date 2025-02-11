@@ -3,12 +3,17 @@ import os
 import string
 import random
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, logging
+import torch
 
+logging.set_verbosity_error()
 
 class MyModel:
     """
     This is a starter model to get you started. Feel free to modify this file.
     """
+    tokenzier = None
+    model = None
 
     @classmethod
     def load_training_data(cls):
@@ -39,26 +44,57 @@ class MyModel:
     def run_pred(self, data):
         # your code here
         preds = []
-        all_chars = string.ascii_letters
+
+        if self.tokenizer is None or self.model is None:
+            print("Please load the model first")
+            return preds
+
+        self.model.eval()
         for inp in data:
-            # this model just predicts a random character each time
-            top_guesses = [random.choice(all_chars) for _ in range(3)]
-            preds.append(''.join(top_guesses))
+            results = []
+            try:
+                input_ids = self.tokenizer(inp).input_ids
+                input_ids = torch.tensor([input_ids[:-1] + [258] + [1]])
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids,
+                        max_new_tokens=30,
+                        num_beams=1,
+                        do_sample=False,
+                        num_return_sequences=1,
+                        early_stopping=False,
+                        output_scores=True,
+                        return_dict_in_generate=True,
+                    )
+                scores = outputs.scores[1][0].clone()
+                scores[self.tokenizer.all_special_ids] = -float("inf")
+                _, indices = torch.topk(scores, k=3)
+                results = [self.tokenizer.decode(ind) for ind in indices]
+            except Exception as e:
+                print(f"Error when testing: {e}")
+
+            preds.append(''.join(results))
+
         return preds
 
     def save(self, work_dir):
         # your code here
         # this particular model has nothing to save, but for demonstration purposes we will save a blank file
-        with open(os.path.join(work_dir, 'model.checkpoint'), 'wt') as f:
-            f.write('dummy save')
+        return
 
     @classmethod
     def load(cls, work_dir):
         # your code here
         # this particular model has nothing to load, but for demonstration purposes we will load a blank file
-        with open(os.path.join(work_dir, 'model.checkpoint')) as f:
-            dummy_save = f.read()
-        return MyModel()
+
+        tokenizer = AutoTokenizer.from_pretrained("google/byt5-small")
+        model = AutoModelForSeq2SeqLM.from_pretrained("google/byt5-small")
+        
+        instance = cls()
+        instance.tokenizer = tokenizer
+        instance.model = model
+
+        return instance
 
 
 if __name__ == '__main__':
