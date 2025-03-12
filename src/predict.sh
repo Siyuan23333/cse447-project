@@ -1,11 +1,13 @@
-#!/usr/bin/env bash
-set -e
-set -v
-# python src/myprogram.py test --work_dir work --test_data $1 --test_output $2
+#!/bin/bash
 
-TEST_DATA=$1
-OUTPUT_FILE=$2
-WORK_DIR="work"
+if [ "$#" -ne 2 ]; then
+    echo "Usage: bash src/predict.sh <path_to_test_data> <path_to_predictions>"
+    exit 1
+fi
 
-python myprogram.py test --work_dir "$WORK_DIR" --test_data "$TEST_DATA" --test_output "$OUTPUT_FILE"
+TEST_DATA_PATH=$1
+OUTPUT_PATH=$2
 
+python /job/src/predict.py --test_data "$TEST_DATA_PATH" --test_output "$OUTPUT_PATH"
+
+echo "Predictions saved to $OUTPUT_PATH"
