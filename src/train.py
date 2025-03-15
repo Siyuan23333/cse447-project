@@ -1,87 +1,156 @@
-import os
-import json
+from typing import List, Dict, Any
+
 import torch
-import random
-import string
-import numpy as np
-from tqdm import tqdm
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModel, AutoTokenizer, AdamW
 
-# Define constants
-MODEL_NAME = "xlm-roberta-base"
-WORK_DIR = "work"
-DATA_PATH = "data/processed/training_data.json"
-BATCH_SIZE = 16
-EPOCHS = 5
-SEQ_LENGTH = 20  # Input sequence length
+class TrainDataCollator:
+    
+    def __init__(
+        self,
+        pad_token_id: int,
+        sentinel_token_id: int,
+        decoder_start_token_id: int,
+        fixed_encoder_length: int,
+        fixed_mask_length: int,
+        token_per_mask: int,
+    ):
+        self.pad_token_id = pad_token_id
+        self.sentinel_token_id = sentinel_token_id
+        self.decoder_start_token_id = decoder_start_token_id
+        self.fixed_encoder_length = fixed_encoder_length
+        self.fixed_mask_length = fixed_mask_length
+        self.token_per_mask = token_per_mask
 
-# Load tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModel.from_pretrained(MODEL_NAME)
-
-# Define an MLP classifier for next-character prediction
-class CharacterPredictor(torch.nn.Module):
-    def __init__(self, base_model):
-        super(CharacterPredictor, self).__init__()
-        self.encoder = base_model
-        self.hidden_size = base_model.config.hidden_size
-        self.classifier = torch.nn.Linear(self.hidden_size, len(string.ascii_letters) + 10)  # Output size
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state[:, -1, :]  # Use last token embedding
-        logits = self.classifier(hidden_states)
-        return logits
-
-# Load dataset
-class CharacterDataset(Dataset):
-    def __init__(self, data_path):
-        with open(data_path, "r") as f:
-            self.data = json.load(f)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        input_seq, target_char = self.data[idx]
-        input_tensor = torch.tensor(input_seq, dtype=torch.long)
-        target_tensor = torch.tensor(target_char, dtype=torch.long)
-        return input_tensor, target_tensor
-
-# Prepare dataset and DataLoader
-dataset = CharacterDataset(DATA_PATH)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-# Initialize model and optimizer
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = CharacterPredictor(model).to(device)
-optimizer = AdamW(model.parameters(), lr=5e-5)
-criterion = torch.nn.CrossEntropyLoss()
-
-# Training loop
-def train():
-    model.train()
-    for epoch in range(EPOCHS):
-        total_loss = 0
-        for input_ids, target in tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
-            input_ids, target = input_ids.to(device), target.to(device)
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        batch_input_ids = []
+        batch_attention_masks = []
+        batch_labels = []
+        batch_decoder_input_ids = []
+        batch_decoder_attention_masks = []
+        
+        for example in examples:
+            input_ids = example["input_ids"]
+            attention_mask = example["attention_mask"]
+            true_length = torch.sum(attention_mask, dim=-1) - 1
             
-            optimizer.zero_grad()
-            logits = model(input_ids, attention_mask=(input_ids > 0).long())
+            mask_start_positions = self.create_mask_starting_positions(true_length)
             
-            loss = criterion(logits, target)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
+            for mask_start in mask_start_positions:
+                variant_input_ids, variant_attention_mask, variant_labels = self.create_variant(
+                    input_ids, attention_mask, true_length, mask_start,
+                )
+                
+                variant_decoder_input_ids = self.shift_tokens_right(variant_labels)
+                variant_decoder_attention_mask = [
+                    1 if token != self.pad_token_id else 0 for token in variant_decoder_input_ids
+                ]
+                
+                batch_input_ids.append(variant_input_ids)
+                batch_attention_masks.append(variant_attention_mask)
+                batch_labels.append(variant_labels)
+                batch_decoder_input_ids.append(variant_decoder_input_ids)
+                batch_decoder_attention_masks.append(variant_decoder_attention_mask)
+        
+        # Convert lists to numpy arrays
+        batch = {
+            "input_ids": np.array(batch_input_ids, dtype=np.int32),
+            "attention_mask": np.array(batch_attention_masks, dtype=np.int32),
+            "labels": np.array(batch_labels, dtype=np.int32),
+            "decoder_input_ids": np.array(batch_decoder_input_ids, dtype=np.int32),
+            "decoder_attention_mask": np.array(batch_decoder_attention_masks, dtype=np.int32),
+        }
+        return batch
+      
+    def create_mask_starting_positions(self, true_length: int) -> List[int]:
+        """
+        Create starting positions for the masked tokens.
+        
+        The function generates a list of starting positions for the masked spans,
+        
+        ensuring that the spans do not exceed the true length of the input.
+        """
+        mask_start_positions = []
+        num_masks = true_length // self.token_per_mask + 1
+        for _ in range(num_masks):
+            start_pos = np.random.randint(0, true_length)
+            mask_start_positions.append(start_pos)
+        
+        return mask_start_positions
 
-        print(f"Epoch {epoch+1}, Loss: {total_loss / len(dataloader)}")
+    def create_variant(self, input_ids: List[int], attention_mask: List[int], true_length: int, mask_start: int):
+        """
+        Create a variant of a single example by masking the last `mask_length` tokens.
+        
+        The encoder input keeps the tokens from the beginning up to (true_length - mask_length),
+        then replaces the masked tokens with a single sentinel token, and pads to a fixed length.
+        
+        The labels are constructed as the sentinel token followed by the masked tokens,
+        then padded to a fixed label length.
+        """
+        # Determine the split: unmasked tokens and masked tokens.
+        unmasked_length = mask_start
+        masked_tokens = input_ids[mask_start:true_length]
+        
+        # Build the new encoder input:
+        # - Keep tokens [0:unmasked_length]
+        # - Insert one sentinel token to represent the masked span
+        encoder_tokens = input_ids[:unmasked_length] + [self.sentinel_token_id]
+        # Pad encoder_tokens to fixed_encoder_length
+        encoder_padding_length = self.fixed_encoder_length - len(encoder_tokens)
+        encoder_tokens = encoder_tokens + [self.pad_token_id] * encoder_padding_length
+        
+        # Build the corresponding encoder attention mask:
+        # 1 for the actual tokens (unmasked + sentinel), 0 for the padded tokens.
+        encoder_attention = [1] * (unmasked_length + 1) + [0] * encoder_padding_length
+        
+        # Build the labels: start with the sentinel token followed by the masked tokens.
+        labels = [self.sentinel_token_id] + masked_tokens
+        labels_padding_length = self.fixed_label_length - len(labels)
+        labels = labels + [self.pad_token_id] * labels_padding_length
+        
+        return encoder_tokens, encoder_attention, labels
 
-    # Save trained model
-    os.makedirs(WORK_DIR, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(WORK_DIR, "xlmr_character_model.pt"))
-    print("Training complete! Model saved.")
+    def shift_tokens_right(self, labels: List[int]) -> List[int]:
+        """
+        Shift labels to the right to produce decoder input ids.
+        Insert the decoder_start_token_id at the beginning and remove the last token.
+        """
+        # Typically, shifting involves removing the last token and prepending the start token.
+        
+        return [self.decoder_start_token_id] + labels[:-1]
 
-if __name__ == "__main__":
-    train()
+
+# === Example usage ===
+
+# Suppose we have the following configuration:
+PAD_TOKEN_ID = 0
+SENTINEL_TOKEN_ID = 258   # Example: T5 uses extra_id tokens at the high end of the vocab.
+DECODER_START_TOKEN_ID = PAD_TOKEN_ID  # For T5, this is typically 0 (or could be the pad token)
+FIXED_ENCODER_LENGTH = 128   # For illustration (in practice, use the desired length)
+FIXED_MASK_LENGTH = 16      # For illustration
+TOKEN_PER_MASK = 16 
+
+collator = TrainDataCollator(
+    pad_token_id=PAD_TOKEN_ID,
+    sentinel_token_id=SENTINEL_TOKEN_ID,
+    decoder_start_token_id=DECODER_START_TOKEN_ID,
+    fixed_encoder_length=FIXED_ENCODER_LENGTH,
+    fixed_mask_length=FIXED_MASK_LENGTH,
+    token_per_mask=TOKEN_PER_MASK,
+)
+
+# An example input: a single sentence that has been tokenized and padded.
+example_sentence = {
+    "input_ids": [101, 102, 103, 104, 105, 106, 107, 108, PAD_TOKEN_ID, PAD_TOKEN_ID, PAD_TOKEN_ID, PAD_TOKEN_ID, PAD_TOKEN_ID, PAD_TOKEN_ID, PAD_TOKEN_ID, PAD_TOKEN_ID],
+    # Assume the real sentence length is 8 tokens.
+    "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1] + [0] * 8,
+}
+
+# Collate a batch (even if batch size is 1, the collator will produce multiple variants)
+batch = collator([example_sentence])
+
+# The output batch will have keys: "input_ids", "attention_mask", "labels", "decoder_input_ids", and "decoder_attention_mask".
+print("input_ids:\n", batch["input_ids"])
+print("attention_mask:\n", batch["attention_mask"])
+print("labels:\n", batch["labels"])
+print("decoder_input_ids:\n", batch["decoder_input_ids"])
+print("decoder_attention_mask:\n", batch["decoder_attention_mask"])

@@ -1,81 +1,80 @@
 import os
-import json
-import torch
-from transformers import AutoTokenizer, MarianMTModel, MarianTokenizer
-from tqdm import tqdm
+import re
 
-# Define paths
-RAW_DATA_DIR = "data/raw"  # Directory containing raw data
-PROCESSED_DATA_DIR = "data/processed"  # Directory for saving processed data
-LANGUAGES = ["fr", "de", "es", "zh"]  # Languages to translate into
-
-# Load XLM-R tokenizer
-xlmr_tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
-
-# MarianMT translation models
-translation_models = {
-    lang: MarianMTModel.from_pretrained(f"Helsinki-NLP/opus-mt-en-{lang}")
-    for lang in LANGUAGES
-}
-translation_tokenizers = {
-    lang: MarianTokenizer.from_pretrained(f"Helsinki-NLP/opus-mt-en-{lang}")
-    for lang in LANGUAGES
-}
-
-def load_raw_data():
-    """ Loads raw NASA astronaut text for preprocessing. """
-    all_texts = []
-    for filename in os.listdir(RAW_DATA_DIR):
-        with open(os.path.join(RAW_DATA_DIR, filename), "r", encoding="utf-8") as f:
-            all_texts.extend(f.readlines())
-    return [line.strip() for line in all_texts if line.strip()]
-
-def translate_text(text, target_lang):
-    """ Translates a given English text to the target language. """
-    tokenizer = translation_tokenizers[target_lang]
-    model = translation_models[target_lang]
+def extract_dialogues_from_file(file_path):
+    """Extracts dialogue lines from a text file based on specific patterns."""
+    dialogues = []
     
-    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-    with torch.no_grad():
-        translated_tokens = model.generate(**inputs)
+    with open(file_path, "r", encoding="utf-8") as file:
+        lines = file.readlines()
     
-    return tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+    # Regex pattern for dialogue lines: time + name format
+    dialogue_pattern = re.compile(r"^\d{3}:\d{2}:\d{2} \w+:.*")
+    
+    # Pattern to identify the special three-line segment
+    special_lines = [
+        "[\n"
+        "Download MP3 audio file\n",
+    ]
+    
+    i = 0
+    while i < len(lines):
+        if i + 1 < len(lines) and dialogue_pattern.match(lines[i]):
+            cleaned_line = re.sub(r"\[.*?\]", "", lines[i + 1].strip())
+            if len(cleaned_line) > 3:
+                dialogues.append(cleaned_line)
+            i += 2
+        elif i + 3 < len(lines) and lines[i] == special_lines[0] and lines[i + 1] == special_lines[1]:
+            dialogues.append(lines[i + 3].strip())
+            i += 4
+        i += 1
+    
+    return dialogues
 
-def preprocess_texts(texts):
-    """ Tokenizes and creates character sequences for training. """
-    tokenized_texts = []
-    seq_length = 20  # Length of input sequence
+def process_apollo_mission_dialogues(mission_id):
+    """Processes all text files for a given Apollo mission and extracts dialogues into a single file."""
+    mission_dir = f"data/raw/apollo_{mission_id}"
+    output_file = f"data/processed/apollo_{mission_id}_dialogues.txt"
+    
+    if not os.path.exists(mission_dir):
+        print(f"Directory not found: {mission_dir}")
+        return
+    
+    all_dialogues = []
+    
+    for file_name in sorted(os.listdir(mission_dir)):
+        file_path = os.path.join(mission_dir, file_name)
+        if file_name.endswith(".txt"):
+            print(f"Processing: {file_path}")
+            dialogues = extract_dialogues_from_file(file_path)
+            all_dialogues.extend(dialogues)
+    
+    with open(output_file, "w", encoding="utf-8") as out_file:
+        out_file.write("\n".join(all_dialogues))
+    
+    print(f"Saved dialogues to {output_file}")
 
-    for text in tqdm(texts, desc="Tokenizing texts"):
-        tokens = xlmr_tokenizer.encode(text, add_special_tokens=True)
-        
-        # Create sliding window sequences
-        for i in range(len(tokens) - seq_length):
-            input_seq = tokens[i : i + seq_length]
-            target_char = tokens[i + seq_length]
-            tokenized_texts.append((input_seq, target_char))
+def process_all_apollo_missions():
+    """Processes dialogues for Apollo 7 to Apollo 17."""
+    for mission_id in range(7, 18):
+        if mission_id < 10:
+            mission_id = f"0{mission_id}"
+        else:
+            mission_id = str(mission_id)
+        process_apollo_mission_dialogues(mission_id)
 
-    return tokenized_texts
+def combine_files(file_dir, output_path):
+    """Combines all text files in a directory into a single file."""
+    
+    with open(output_path, "w", encoding="utf-8") as out_file:
+        for file_name in sorted(os.listdir(file_dir)):
+            file_path = os.path.join(file_dir, file_name)
+            if file_name.endswith(".txt"):
+                with open(file_path, "r", encoding="utf-8") as in_file:
+                    out_file.write(in_file.read())
+    
+    print(f"Combined dialogues saved to {output_path}")
 
-def save_processed_data(data, filename):
-    """ Saves processed data as JSON. """
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-    with open(os.path.join(PROCESSED_DATA_DIR, filename), "w") as f:
-        json.dump(data, f)
 
 if __name__ == "__main__":
-    print("Loading raw data...")
-    texts = load_raw_data()
-    
-    print("Translating texts to multiple languages...")
-    all_translations = texts.copy()  # Keep original English texts
-    for lang in LANGUAGES:
-        all_translations.extend([translate_text(text, lang) for text in tqdm(texts, desc=f"Translating to {lang}")])
-
-    print("Tokenizing and generating sequences...")
-    tokenized_data = preprocess_texts(all_translations)
-    
-    print("Saving processed data...")
-    save_processed_data(tokenized_data, "training_data.json")
-
-    print("Preprocessing complete! Data saved in 'data/processed/training_data.json'")
+    process_all_apollo_missions()
